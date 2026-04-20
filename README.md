@@ -105,27 +105,26 @@ python predict.py -i protein_min.pdb -o predictions
 ```
 ### Output
 
+Output
+
 Arguments:
 
--i  → Required. Path to the minimized PDB file.
-
--o  → Optional. Folder where the prediction CSV will be saved.
+-i → Required. Path to the minimized PDB file.
+-o → Optional. Folder where the prediction CSV will be saved.
 
 If not provided, the output CSV will be automatically saved in the same folder as the input PDB.
 
 The output folder will be created automatically if it does not exist.
- 
-The prediction CSV contains three columns:
+
+The prediction CSV contains the following columns:
 
 residue → Index of the residue in the protein chain
-
-probability → Predicted probability of flexibility (sigmoid output)
-
+predicted_rmsf_norm → Predicted normalized RMSF value (regression output from the model)
 predicted_binary → Binary classification (0 or 1) based on the threshold
 
-The predicted_prob column can be used for regression-style plots or further analysis, while predicted_binary is for classification-based analysis.
+The predicted_rmsf_norm column represents the continuous flexibility score predicted by the model and can be used for regression analysis, plotting flexibility profiles, or downstream statistical analysis.
 
-The predicted_binary column is always provided for classification-based analysis.
+The predicted_binary column is derived from the RMSF prediction using a threshold and is used for classification-based interpretation (flexible vs non-flexible residues).
 
 ## Quickstart Example
 
@@ -133,7 +132,7 @@ This example demonstrates a full run from raw PDB → preprocessing → predicti
 
 ### Step 1. Preprocess the PDB
 
-Place the raw PDB file in the folder (already included: `15m99A02.pdb`).
+Place the raw PDB file in the folder (already included: `5m99A02.pdb`).
 
 Run the preprocessing script:
 

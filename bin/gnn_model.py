@@ -1,39 +1,40 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 
+# =========================
+# ACTIVATION FUNCTION
+# =========================
 def get_activation_fn(name):
-    if name == 'ReLU': return nn.ReLU()
-    elif name == 'Tanh': return nn.Tanh()
-    elif name == 'LeakyReLU': return nn.LeakyReLU()
-    elif name == 'ELU': return nn.ELU()
-    else: raise ValueError(f"Unknown activation function: {name}")
+    if name == 'ReLU':
+        return nn.ReLU()
+    elif name == 'Tanh':
+        return nn.Tanh()
+    elif name == 'LeakyReLU':
+        return nn.LeakyReLU()
+    elif name == 'ELU':
+        return nn.ELU()
+    else:
+        raise ValueError(f"Unknown activation function: {name}")
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.5, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-    def forward(self, inputs, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        probs = torch.sigmoid(inputs)
-        pt = torch.where(targets == 1, probs, 1 - probs)
-        focal_weight = (1 - pt) ** self.gamma
-        loss = self.alpha * focal_weight * bce_loss
-        return loss.mean() if self.reduction == 'mean' else loss.sum()
 
+# =========================
+# REGRESSION MODEL (RAW RMSF)
+# =========================
 class NodeMLP_GCN(nn.Module):
     def __init__(self, in_node_feats, hidden_dim=256, num_gcn_layers=5,
                  dropout=0.3, use_residual=True, use_batch_norm=False,
                  activation='ReLU', use_bias=True):
+
         super().__init__()
+
         self.use_residual = use_residual
         self.use_batch_norm = use_batch_norm
         self.activation_fn = get_activation_fn(activation)
 
-        # Updated node MLP structure as per request
+        # =========================
+        # NODE FEATURE MLP
+        # =========================
         self.node_mlp = nn.Sequential(
             nn.Linear(in_node_feats, 64, bias=use_bias),
             self.activation_fn,
@@ -43,33 +44,58 @@ class NodeMLP_GCN(nn.Module):
             self.activation_fn,
             nn.Linear(128, 256, bias=use_bias),
             self.activation_fn,
-            nn.Linear(256, hidden_dim, bias=use_bias),  # final projection to hidden_dim
+            nn.Linear(256, hidden_dim, bias=use_bias),
             self.activation_fn,
             nn.Dropout(dropout)
         )
 
+        # =========================
+        # GCN LAYERS (WITH EDGE WEIGHTS)
+        # =========================
+        self.gcn_layers = nn.ModuleList([
+            GCNConv(hidden_dim, hidden_dim, bias=use_bias)
+            for _ in range(num_gcn_layers)
+        ])
+
         if use_batch_norm:
-            self.bn_layers = nn.ModuleList([nn.BatchNorm1d(hidden_dim) for _ in range(num_gcn_layers)])
+            self.bn_layers = nn.ModuleList([
+                nn.BatchNorm1d(hidden_dim)
+                for _ in range(num_gcn_layers)
+            ])
         else:
             self.bn_layers = None
 
-        self.gcn_layers = nn.ModuleList(
-            [GCNConv(hidden_dim, hidden_dim, bias=use_bias) for _ in range(num_gcn_layers)]
-        )
+        # =========================
+        # OUTPUT LAYER
+        # =========================
+        self.out = nn.Linear(hidden_dim, 1)  # RAW RMSF
 
-        self.out = nn.Linear(hidden_dim, 1)
-
+    # =========================
+    # FORWARD
+    # =========================
     def forward(self, x, edge_index, edge_attr=None, batch=None):
+
+        # NODE EMBEDDING
         x = self.node_mlp(x)
+
+        # GCN LAYERS
         for i, gcn in enumerate(self.gcn_layers):
             x_res = x
-            x = gcn(x, edge_index)
-            if self.bn_layers:
+
+            if edge_attr is not None:
+                x = gcn(x, edge_index, edge_weight=edge_attr)
+            else:
+                x = gcn(x, edge_index)
+
+            if self.bn_layers is not None:
                 x = self.bn_layers[i](x)
+
             x = self.activation_fn(x)
+
             if self.use_residual:
                 x = x + x_res
-        logits = self.out(x).squeeze(-1)
-        probs = torch.sigmoid(logits)
-        return logits, probs
 
+        # RAW OUTPUT (per residue)
+        preds = self.out(x).squeeze(-1)  # shape: [num_nodes]
+
+        return preds, None

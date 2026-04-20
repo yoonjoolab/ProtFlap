@@ -1,41 +1,42 @@
 import os
 import csv
-import torch
 import logging
-import pandas as pd
+import subprocess
+import re
+import shutil
+from copy import deepcopy
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import optuna
-import subprocess
-import re
 import networkx as nx
-import shutil
-from torch.utils.data import DataLoader, Dataset, random_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_curve, auc, matthews_corrcoef, precision_score, recall_score
-from sklearn.model_selection import KFold, StratifiedKFold, ParameterSampler
-from torch.utils.data import DataLoader, Dataset, random_split
-from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GCNConv, global_mean_pool, SAGEConv, GATConv
+import torch
+
+# PyTorch
+from torch.utils.data import Dataset, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-
-from copy import deepcopy
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from torch.utils.data import DataLoader, Dataset
+# PyTorch Geometric
 from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool, SAGEConv, GATConv
+
+# Sklearn (Regression)
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# Bio / Features
 from Bio import PDB
 from Bio.PDB.DSSP import dssp_dict_from_pdb_file
 from aaindex import aaindex1
 
-# ✅ Import from your modular files
-from .gnn_model import NodeMLP_GCN, FocalLoss
-from .evaluate import compute_metrics, evaluate_and_plot_confusion_matrix_per_residue
-
+# ✅ Your modules (cleaned)
+from .gnn_model import NodeMLP_GCN
 from .data_utils import load_rmsf_data
 from .prediction_utils import get_predictions, compare_rmsf_and_predictions
-
 
 torch.manual_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -271,7 +272,7 @@ def load_and_present_pdb(pdb_file):
     return node_features_tensor, protein_graphs, node_features_dict
 
 
-def create_protein_graph(structure, chain_id, max_distance=30.0):
+def create_protein_graph(structure, chain_id, max_distance=10.0):
     graph = nx.Graph()
     chain = structure[0][chain_id]
     residues = [residue for residue in chain if PDB.is_aa(residue)]
@@ -283,80 +284,132 @@ def create_protein_graph(structure, chain_id, max_distance=30.0):
             if distance < max_distance:
                 graph.add_edge(i, j, distance=distance)
     return graph
-
+    
 def build_dataset_from_folder(folder: str):
     data_list = []
+
     for filename in os.listdir(folder):
         if not filename.endswith(".pdb"):
             continue
+
         pdb_path = os.path.join(folder, filename)
         pdb_name = os.path.splitext(filename)[0]
+
         result = load_and_present_pdb(pdb_path)
         if result is None:
             continue
+
         node_features_tensor, protein_graphs, node_features_dict = result
+
         csv_file = os.path.join(folder, f"{pdb_name}.csv")
         if not os.path.exists(csv_file):
+            print(f"Skipping {pdb_name}: CSV file not found")
             continue
+
         df = pd.read_csv(csv_file)
         if "rmsf_norm" not in df.columns:
+            print(f"Skipping {pdb_name}: 'rmsf_norm' column not found")
             continue
+
+        # target already normalized
         rmsf = df["rmsf_norm"].values.astype(np.float32)
-        labels = (rmsf > 0).astype(np.float32)  # threshold 0 as requested
-        scaler = StandardScaler()
-        node_features_tensor = torch.tensor(scaler.fit_transform(node_features_tensor), dtype=torch.float)
+
+        all_x = []
+        all_residue_indices = []
+        src_list, dst_list, edge_weights = [], [], []
+
+        node_offset = 0
+
         for chain_id, G in protein_graphs.items():
             n = G.number_of_nodes()
             if n == 0:
                 continue
-            x = torch.tensor([node_features_dict[chain_id][i] for i in range(n)], dtype=torch.float)
-            x = torch.tensor(scaler.fit_transform(x), dtype=torch.float)
-            src_list, dst_list = [], []
-            coords = np.array([node_features_dict[chain_id][i][:3] for i in range(n)])
-            for i in range(n):
-                for j in range(i + 1, n):
-                    dist = np.linalg.norm(coords[i] - coords[j])
-                    if dist <= 30.0:
-                        src_list.extend([i, j])
-                        dst_list.extend([j, i])
-            if len(src_list) == 0:
-                edge_index = torch.arange(n, dtype=torch.long).repeat(2, 1)
-            else:
-                edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-            L = min(x.shape[0], len(labels))
-            if L == 0:
-                continue
-            x = x[:L]
-            y = torch.tensor(labels[:L], dtype=torch.float)
-            edge_index = torch.clamp(edge_index, min=0, max=L - 1)
-            data = Data(x=x, edge_index=edge_index, y=y)
-            data.pdb_name = pdb_name
-            data_list.append(data)
-    return data_list
 
+            # node features for this chain
+            x_chain = np.array([node_features_dict[chain_id][i] for i in range(n)])
+
+            # scale node features
+            scaler_x = StandardScaler()
+            x_chain = scaler_x.fit_transform(x_chain)
+
+            all_x.append(x_chain)
+
+            # residue indices for this chain in the final merged graph
+            all_residue_indices.extend(range(node_offset, node_offset + n))
+
+            # use edges already present in the graph
+            for u, v, attrs in G.edges(data=True):
+                dist = attrs.get("distance", 10.0)
+                weight = 1.0 / (dist + 1e-6)
+
+                src_list.extend([u + node_offset, v + node_offset])
+                dst_list.extend([v + node_offset, u + node_offset])
+                edge_weights.extend([weight, weight])
+
+            node_offset += n
+
+        if len(all_x) == 0:
+            print(f"Skipping {pdb_name}: no valid node features")
+            continue
+
+        x = np.vstack(all_x)
+        total_nodes = x.shape[0]
+
+        # require exact residue match
+        if total_nodes != len(rmsf):
+            print(
+                f"Skipping {pdb_name}: residue mismatch "
+                f"(graph={total_nodes}, rmsf={len(rmsf)})"
+            )
+            continue
+
+        x = torch.tensor(x, dtype=torch.float)
+        y = torch.tensor(rmsf, dtype=torch.float)
+
+        if len(src_list) == 0:
+            edge_index = torch.arange(total_nodes, dtype=torch.long).repeat(2, 1)
+            edge_attr = torch.ones(edge_index.size(1), dtype=torch.float)
+        else:
+            edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+            edge_attr = torch.tensor(edge_weights, dtype=torch.float)
+
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=y
+        )
+
+        data.pdb_name = pdb_name
+        data.residue_indices = torch.arange(total_nodes, dtype=torch.long)
+
+        data_list.append(data)
+        print(f"Added {pdb_name}: {total_nodes} residues")
+
+    return data_list
+    
 def train_and_evaluate(trial, data_list):
-    # Suggest hyperparameters with Optuna
+
     lr = trial.suggest_categorical("learning_rate", [1e-2, 1e-3, 1e-4])
     dropout = trial.suggest_float("dropout", 0.001, 0.3)
-    weight_decay = trial.suggest_categorical("weight_decay", [1e-4, 1e-3, 1e-2, 1e-1])
+    weight_decay = trial.suggest_categorical("weight_decay", [1e-4, 1e-3, 1e-2])
     batch_norm = trial.suggest_categorical("batch_norm", [True, False])
     residual = trial.suggest_categorical("residual", [True, False])
-    activation = trial.suggest_categorical("activation", ["ReLU", "Tanh", "LeakyReLU", "ELU"])
+    activation = trial.suggest_categorical("activation", ["ReLU", "ELU"])
     use_bias = trial.suggest_categorical("use_bias", [True, False])
     hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
     num_gcn_layers = trial.suggest_int("num_gcn_layers", 2, 6)
 
     n = len(data_list)
     n_train = int(0.9 * n)
+
     train_ds, val_ds = random_split(data_list, [n_train, n - n_train])
 
     train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=Batch.from_data_list)
-    val_loader = DataLoader(val_ds, batch_size=16, shuffle=True, collate_fn=Batch.from_data_list)
-
-    in_node_feats = data_list[0].x.size(1)
+    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, collate_fn=Batch.from_data_list)
 
     model = NodeMLP_GCN(
-        in_node_feats,
+        data_list[0].x.size(1),
         hidden_dim=hidden_dim,
         num_gcn_layers=num_gcn_layers,
         dropout=dropout,
@@ -367,35 +420,47 @@ def train_and_evaluate(trial, data_list):
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = FocalLoss(alpha=0.5, gamma=2.0)
+
+    # ✅ REGRESSION LOSS
+    criterion = torch.nn.SmoothL1Loss()
 
     best_val_loss = float("inf")
     patience = 20
     patience_counter = 0
 
-    for epoch in range(1, 101):
+    for epoch in range(100):
         model.train()
-        total_train_loss, total_train_nodes = 0, 0
+        total_loss = 0
+        total_nodes = 0
+
         for batch in train_loader:
             batch = batch.to(device)
+
             optimizer.zero_grad()
-            logits, _ = model(batch.x, batch.edge_index)
-            loss = criterion(logits, batch.y.float())
+            preds, _ = model(batch.x, batch.edge_index)
+
+            loss = criterion(preds, batch.y)
             loss.backward()
             optimizer.step()
-            total_train_loss += loss.item() * batch.num_nodes
-            total_train_nodes += batch.num_nodes
-        train_loss = total_train_loss / total_train_nodes
 
+            total_loss += loss.item() * batch.num_nodes
+            total_nodes += batch.num_nodes
+
+        train_loss = total_loss / total_nodes
+
+        # === VALIDATION ===
         model.eval()
         total_val_loss, total_val_nodes = 0, 0
+
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                logits, _ = model(batch.x, batch.edge_index)
-                loss = criterion(logits, batch.y.float())
+                preds, _ = model(batch.x, batch.edge_index)
+
+                loss = criterion(preds, batch.y)
                 total_val_loss += loss.item() * batch.num_nodes
                 total_val_nodes += batch.num_nodes
+
         val_loss = total_val_loss / total_val_nodes
 
         if val_loss < best_val_loss:
@@ -410,20 +475,29 @@ def train_and_evaluate(trial, data_list):
     return best_val_loss
 
 def train_one_fold(
-    fold_id, train_idx, val_idx, dataset, best_params, epochs=100, batch_size=16, patience=20
+    fold_id, train_idx, val_idx, dataset, best_params,
+    device="cpu", epochs=100, batch_size=16, patience=20
 ):
+    # ===== DATA LOADERS =====
     train_ds = [dataset[i] for i in train_idx]
     val_ds = [dataset[i] for i in val_idx]
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, collate_fn=Batch.from_data_list
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=Batch.from_data_list
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, collate_fn=Batch.from_data_list
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=Batch.from_data_list
     )
 
     in_node_feats = dataset[0].x.size(1)
 
+    # ===== MODEL =====
     model = NodeMLP_GCN(
         in_node_feats,
         hidden_dim=best_params["hidden_dim"],
@@ -432,102 +506,168 @@ def train_one_fold(
         use_residual=best_params["residual"],
         use_batch_norm=best_params["batch_norm"],
         activation=best_params["activation"],
-        use_bias=best_params["use_bias"],
+        use_bias=best_params["use_bias"]
     ).to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=best_params["learning_rate"],
-        weight_decay=best_params["weight_decay"],
+        weight_decay=best_params["weight_decay"]
     )
-    criterion = FocalLoss(alpha=0.5, gamma=2.0)
 
+    criterion = torch.nn.SmoothL1Loss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.7, patience=5, verbose=True
+        optimizer, factor=0.7, patience=10
     )
 
-    best_train_loss = float("inf")
+    best_val_loss = float("inf")
     best_model_state = None
     patience_counter = 0
-    same_loss_counter = 0  # <-- to track repeated loss
-    train_losses, val_losses = [], []
 
+    train_losses = []
+    val_losses = []
+
+    # store best epoch outputs
+    best_epoch_preds = None
+    best_epoch_targets = None
+    best_epoch_pdb_names = None
+    best_epoch_residue_indices = None
+    best_epoch_metrics = None
+
+    # ===== TRAINING LOOP =====
     for epoch in range(1, epochs + 1):
-        # === Training ===
+        # ===== TRAIN =====
         model.train()
-        total_train_loss, total_train_nodes = 0, 0
+        total_train_loss = 0.0
+        total_train_nodes = 0
+
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            logits, _ = model(batch.x, batch.edge_index)
-            loss = criterion(logits, batch.y.float())
+
+            preds, _ = model(batch.x, batch.edge_index)
+            loss = criterion(preds, batch.y)
+
             loss.backward()
             optimizer.step()
+
             total_train_loss += loss.item() * batch.num_nodes
             total_train_nodes += batch.num_nodes
-        train_loss = total_train_loss / total_train_nodes
 
-        # === Validation (monitoring only) ===
+        train_loss = total_train_loss / total_train_nodes
+        train_losses.append(train_loss)
+
+        # ===== VALIDATION =====
         model.eval()
-        total_val_loss, total_val_nodes = 0, 0
-        all_preds, all_targets, all_probs = [], [], []
+        total_val_loss = 0.0
+        total_val_nodes = 0
+
+        all_preds = []
+        all_targets = []
+        pdb_names = []
+        residue_indices = []
+
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
-                logits, _ = model(batch.x, batch.edge_index)
-                loss = criterion(logits, batch.y.float())
+
+                preds, _ = model(batch.x, batch.edge_index)
+                loss = criterion(preds, batch.y)
+
                 total_val_loss += loss.item() * batch.num_nodes
                 total_val_nodes += batch.num_nodes
-                probs = torch.sigmoid(logits)
-                all_probs.append(probs.cpu().numpy())
-                all_preds.append((probs > 0.5).cpu().numpy())
-                all_targets.append(batch.y.cpu().numpy())
+
+                batch_preds = preds.detach().cpu().numpy().flatten()
+                batch_targets = batch.y.detach().cpu().numpy().flatten()
+
+                all_preds.extend(batch_preds)
+                all_targets.extend(batch_targets)
+
+                # ===== CORRECT GRAPH-WISE MAPPING =====
+                ptr = batch.ptr.cpu().numpy()
+
+                if hasattr(batch, "residue_indices") and batch.residue_indices is not None:
+                    batch_residue_indices = batch.residue_indices.cpu().numpy()
+                else:
+                    batch_residue_indices = np.arange(len(batch_targets))
+
+                batch_pdb_names = getattr(batch, "pdb_name", "Unknown")
+                if not isinstance(batch_pdb_names, (list, tuple, np.ndarray)):
+                    batch_pdb_names = [batch_pdb_names]
+
+                for i in range(len(batch_pdb_names)):
+                    start = ptr[i]
+                    end = ptr[i + 1]
+                    n_nodes_graph = end - start
+
+                    pdb_names.extend([batch_pdb_names[i]] * n_nodes_graph)
+                    residue_indices.extend(batch_residue_indices[start:end].tolist())
+
         val_loss = total_val_loss / total_val_nodes
-
-        all_preds = np.concatenate(all_preds)
-        all_targets = np.concatenate(all_targets)
-        all_probs = np.concatenate(all_probs)
-        acc, f1, mcc, precision, recall, fpr, tpr, roc_auc = compute_metrics(
-            all_targets, all_preds, all_probs
-        )
-
-        train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        scheduler.step(train_loss)  # reduce LR based on training loss
+        # ===== METRICS =====
+        all_preds_np = np.array(all_preds)
+        all_targets_np = np.array(all_targets)
+
+        rmse = np.sqrt(mean_squared_error(all_targets_np, all_preds_np))
+        mae = mean_absolute_error(all_targets_np, all_preds_np)
+        r2 = r2_score(all_targets_np, all_preds_np)
+
+        scheduler.step(val_loss)
 
         print(
-            f"[Fold {fold_id}] Epoch {epoch:03d} | Train Loss: {train_loss:.4f} "
-            f"| Val Loss: {val_loss:.4f} | Acc: {acc:.4f} | F1: {f1:.4f} | AUC: {roc_auc:.4f}"
+            f"[Fold {fold_id}] Epoch {epoch:03d} | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"RMSE: {rmse:.4f} | MAE: {mae:.4f} | R2: {r2:.4f}"
         )
 
-        # === Save best model based on training loss ===
-        if train_loss < best_train_loss:
-            if train_loss == best_train_loss:  
-                same_loss_counter += 1
-            else:
-                same_loss_counter = 0  # reset if new improvement
-
-            best_train_loss = train_loss
+        # ===== SAVE BEST =====
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_model_state = model.state_dict()
             patience_counter = 0
+
+            best_epoch_preds = all_preds_np.copy()
+            best_epoch_targets = all_targets_np.copy()
+            best_epoch_pdb_names = pdb_names.copy()
+            best_epoch_residue_indices = residue_indices.copy()
+            best_epoch_metrics = (rmse, mae, r2)
         else:
             patience_counter += 1
 
-        # === Early stopping conditions ===
+        # ===== EARLY STOPPING =====
         if patience_counter >= patience:
-            print(f"[Fold {fold_id}] Early stopping (patience {patience}) at epoch {epoch}")
-            break
-        if same_loss_counter >= 20:  # <-- stop if no improvement for 20 epochs
-            print(f"[Fold {fold_id}] Early stopping (no improvement for 20 epochs) at epoch {epoch}")
+            print(f"[Fold {fold_id}] Early stopping at epoch {epoch}")
             break
 
+    # safety check
+    if best_model_state is None:
+        raise ValueError(f"No best model state was saved for fold {fold_id}")
+
+    # ===== LOAD AND SAVE BEST MODEL =====
     model.load_state_dict(best_model_state)
-    torch.save(model.state_dict(), f"best_model_fold{fold_id}.pth")
+    model_path = f"best_model_fold{fold_id}.pth"
+    torch.save(model.state_dict(), model_path)
+    print(f"[Fold {fold_id}] Best Val Loss: {best_val_loss:.4f}")
 
-    print(f"[Fold {fold_id}] Best train loss: {best_train_loss:.4f}")
+    # ===== SAVE CSV PER RESIDUE =====
+    df = compare_rmsf_and_predictions(
+        best_epoch_pdb_names,
+        best_epoch_residue_indices,
+        best_epoch_targets,
+        best_epoch_preds
+    )
+    df.to_csv(f"fold_{fold_id}_predictions.csv", index=False)
 
-    # === Plot Loss Curve ===
+    # ===== SAVE METRICS =====
+    best_rmse, best_mae, best_r2 = best_epoch_metrics
+    with open(f"fold_{fold_id}_metrics.txt", "w") as f:
+        f.write(f"RMSE: {best_rmse:.4f}\n")
+        f.write(f"MAE: {best_mae:.4f}\n")
+        f.write(f"R2: {best_r2:.4f}\n")
+
+    # ===== PLOTS =====
     plt.figure()
     plt.plot(train_losses, label="Train Loss")
     plt.plot(val_losses, label="Validation Loss")
@@ -536,84 +676,104 @@ def train_one_fold(
     plt.savefig(f"loss_curve_fold{fold_id}.png")
     plt.close()
 
-    # === Save report ===
-    with open(f"classification_report_fold{fold_id}.txt", "w") as f:
-        f.write(f"Accuracy: {acc:.4f}\n")
-        f.write(f"F1 Score: {f1:.4f}\n")
-        f.write(f"MCC: {mcc:.4f}\n")
-        f.write(f"Precision: {precision:.4f}\n")
-        f.write(f"Recall: {recall:.4f}\n")
-        f.write(f"AUC: {roc_auc:.4f}\n")
+    plt.figure()
+    plt.scatter(best_epoch_targets, best_epoch_preds, alpha=0.5)
+    plt.xlabel("Target RMSF")
+    plt.ylabel("Predicted RMSF")
+    plt.title(f"Regression Scatter Fold {fold_id}")
+    plt.savefig(f"scatter_fold{fold_id}.png")
+    plt.close()
 
-    evaluate_and_plot_confusion_matrix_per_residue(
-        model,
-        val_loader,
-        device=device,
-        load_rmsf_fn=load_rmsf_data,
-        fold_id=fold_id,
-    )
-
-    return best_train_loss, f"best_model_fold{fold_id}.pth", (fpr, tpr, roc_auc)
-
+    return best_val_loss, model_path, best_epoch_metrics
+    
 def run_cross_validation(dataset, best_params, n_splits=10):
+
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
     fold_results = []
 
-    plt.figure(figsize=(8, 6))
-
     for fold_id, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
-        print(f"Fold {fold_id}: {len(train_idx)} training graphs, {len(val_idx)} validation graphs")
 
-        best_train_loss, model_path, roc_data = train_one_fold(
+        print(f"\nFold {fold_id}: {len(train_idx)} train, {len(val_idx)} val")
+
+        best_loss, model_path, _ = train_one_fold(
             fold_id, train_idx, val_idx, dataset, best_params
         )
 
-        fpr, tpr, roc_auc = roc_data
-        plt.plot(fpr, tpr, label=f"Fold {fold_id} (AUC={roc_auc:.4f})")
+        fold_results.append((best_loss, model_path))
 
-        fold_results.append((best_train_loss, model_path))
-
-    # === Select the best fold ===
+    # ✅ SELECT BEST MODEL
     best_fold = min(fold_results, key=lambda x: x[0])
     os.rename(best_fold[1], "best_model_cv.pth")
-    print(f"Best model selected: {best_fold[1]} -> saved as best_model_cv.pth")
 
-    # === Final ROC figure ===
-    plt.plot([0, 1], [0, 1], 'k--', label="Random")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title(f"ROC Curves for {n_splits}-Fold Cross-Validation")
-    plt.legend()
-    plt.savefig(f"roc_curves_{n_splits}fold.png")
-    plt.close()
+    print(f"\n✅ Best model: {best_fold[1]} → saved as best_model_cv.pth")
 
+def analyze_graph_connectivity(dataset):
+    total_residues = 0
+    total_isolated_residues = 0
+    pdbs_with_isolated = 0
+    pdbs_not_complete = 0
+
+    for data in dataset:
+        n = data.num_nodes
+        total_residues += n
+
+        # Count node degrees
+        degrees = torch.zeros(n)
+        for i in data.edge_index[0]:
+            degrees[i] += 1
+
+        isolated = (degrees == 0).sum().item()
+        total_isolated_residues += isolated
+
+        if isolated > 0:
+            pdbs_with_isolated += 1
+
+        # Check if complete graph
+        expected_edges = n * (n - 1)
+        actual_edges = data.edge_index.size(1)
+
+        if actual_edges < expected_edges:
+            pdbs_not_complete += 1
+
+    print("\n===== GRAPH ANALYSIS (Cutoff = 10 Å) =====")
+    print(f"Total residues: {total_residues}")
+    print(f"Total isolated residues: {total_isolated_residues}")
+    print(f"Residues lost due to cutoff: {total_isolated_residues}")
+    print(f"PDBs with isolated residues: {pdbs_with_isolated}")
+    print(f"PDBs NOT complete graphs: {pdbs_not_complete}")
 
 if __name__ == "__main__":
     folder = os.getcwd()
+
+    # === Build dataset ===
     dataset = build_dataset_from_folder(folder)
     print(f"Built {len(dataset)} protein graphs.")
 
-    # Count and print total flexible and non-flexible residues before training
+    # === NEW: Analyze graph connectivity (cutoff = 10 Å) ===
+    analyze_graph_connectivity(dataset)
+
+    # === Count flexible vs non-flexible residues ===
     flexible_count, non_flexible_count = count_flexible_residues(dataset)
     print(f"Total flexible residues: {flexible_count}")
     print(f"Total non-flexible residues: {non_flexible_count}")
 
-    # Create Optuna study and optimize hyperparameters
+    # === Hyperparameter optimization ===
     study = optuna.create_study(direction="minimize")
-    study.optimize(lambda trial: train_and_evaluate(trial, dataset), n_trials=20)  # or more trials
+    study.optimize(lambda trial: train_and_evaluate(trial, dataset), n_trials=25)
 
     trial = study.best_trial
     print("Best hyperparameters:")
     for key, value in trial.params.items():
         print(f"  {key}: {value}")
 
-    # Save best hyperparameters and info to a text file
+    # === Save best hyperparameters ===
     with open("best_hyperparameters.txt", "w") as f:
         f.write("Best trial hyperparameters:\n")
         for key, value in trial.params.items():
             f.write(f"{key}: {value}\n")
         f.write(f"\nBest trial value (lowest validation loss): {trial.value:.4f}\n")
 
-    # Run cross-validation with the best found parameters
+    # === Run 10-fold cross validation ===
     run_cross_validation(dataset, trial.params, n_splits=10)
 
