@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Tinker Minimization + Energy Analysis Pipeline
-
-- Minimizes PDB(s) given via -i/--input (produces *_min.pdb in input folder).
-- Generates atom-level CSV: <base>_energy.csv
-- Generates per-residue averaged CSV: <base>.csv
-- Cleans up intermediate files (.xyz, .txt, .seq).
-- If -o is specified, final min PDB and CSVs are moved there.
-"""
-
 import subprocess
 from pathlib import Path
 import glob
