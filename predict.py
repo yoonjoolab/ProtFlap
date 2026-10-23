@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
 
 import os
+import time
 import torch
 import numpy as np
 import pandas as pd
@@ -24,34 +24,105 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # CONFIG
 # =====================================================
 MODEL_PATH = "models/best_model_cv.pth"
+PARAMETER_PATH = "models/best_hyperparameters.txt"
+
 BINARY_THRESHOLD = 0.0
 
-best_params = {
-    "learning_rate": 0.0001,
-    "dropout": 0.1667,
-    "weight_decay": 0.0001,
-    "batch_norm": False,
-    "residual": True,
-    "activation": "ELU",
-    "use_bias": True,
-    "hidden_dim": 128,
-    "num_gcn_layers": 5
-}
+
+# =====================================================
+# LOAD HYPERPARAMETERS
+# =====================================================
+def load_hyperparameters(filepath):
+
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"Hyperparameter file not found: {filepath}"
+        )
+
+    params = {}
+
+    with open(filepath, "r") as file:
+        for line in file:
+
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if ":" in line:
+                key, value = line.split(":", 1)
+
+            elif "=" in line:
+                key, value = line.split("=", 1)
+
+            else:
+                continue
+
+            key = key.strip()
+            value = value.strip().strip("\"'")
+
+            if value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+
+            elif value.lower() in ("none", "null"):
+                value = None
+
+            else:
+                try:
+                    if any(char in value.lower() for char in (".", "e")):
+                        value = float(value)
+                    else:
+                        value = int(value)
+
+                except ValueError:
+                    pass
+
+            params[key] = value
+
+    required_params = [
+        "hidden_dim",
+        "num_gcn_layers",
+        "dropout",
+        "residual",
+        "batch_norm",
+        "activation",
+        "use_bias",
+    ]
+
+    missing = [
+        key for key in required_params
+        if key not in params
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing required hyperparameters in {filepath}: {missing}"
+        )
+
+    return params
 
 
+# =====================================================
+# BUILD DATASET FROM SINGLE PDB
+# =====================================================
 def build_dataset_from_single_pdb(pdb_file: str):
 
     pdb_file = os.path.abspath(pdb_file)
     pdb_dir = os.path.dirname(pdb_file)
     pdb_name = os.path.splitext(os.path.basename(pdb_file))[0]
 
-    csv_file = os.path.join(pdb_dir, f"{pdb_name}.csv")
+    csv_file = os.path.join(
+        pdb_dir,
+        f"{pdb_name}.csv"
+    )
 
     if not os.path.exists(csv_file):
-        print(f"Skipping {pdb_name}: CSV file not found")
-        return []
+        raise FileNotFoundError(
+            f"Required CSV file not found: {csv_file}"
+        )
 
     result = load_and_present_pdb(pdb_file)
+
     if result is None:
         return []
 
@@ -63,59 +134,89 @@ def build_dataset_from_single_pdb(pdb_file: str):
     node_offset = 0
 
     # =====================================================
-    # SAME STRUCTURE AS TRAINING LOOP
+    # NODE FEATURES AND EDGES
     # =====================================================
     for chain_id, G in protein_graphs.items():
 
         n = G.number_of_nodes()
+
         if n == 0:
             continue
 
-        # -----------------------------
-        # NODE FEATURES (IDENTICAL TO TRAINING)
-        # -----------------------------
-        x_chain = np.array([node_features_dict[chain_id][i] for i in range(n)])
+        # NODE FEATURES
+        x_chain = np.array([
+            node_features_dict[chain_id][i]
+            for i in range(n)
+        ])
 
         scaler_x = StandardScaler()
         x_chain = scaler_x.fit_transform(x_chain)
 
         all_x.append(x_chain)
 
-        # -----------------------------
-        # EDGES (IDENTICAL TO TRAINING)
-        # -----------------------------
+        # EDGES
         for u, v, attrs in G.edges(data=True):
 
-            dist = attrs.get("distance", 10.0)
+            dist = attrs.get("distance", 15.0)
             weight = 1.0 / (dist + 1e-6)
 
-            src_list.extend([u + node_offset, v + node_offset])
-            dst_list.extend([v + node_offset, u + node_offset])
-            edge_weights.extend([weight, weight])
+            src_list.extend([
+                u + node_offset,
+                v + node_offset
+            ])
+
+            dst_list.extend([
+                v + node_offset,
+                u + node_offset
+            ])
+
+            edge_weights.extend([
+                weight,
+                weight
+            ])
 
         node_offset += n
 
     if len(all_x) == 0:
-        print(f"Skipping {pdb_name}: no valid node features")
         return []
 
     x = np.vstack(all_x)
     total_nodes = x.shape[0]
 
-    x = torch.tensor(x, dtype=torch.float)
+    x = torch.tensor(
+        x,
+        dtype=torch.float
+    )
 
     # =====================================================
-    # EDGE TENSOR (SAME LOGIC AS TRAINING)
+    # EDGE TENSOR
     # =====================================================
     if len(src_list) == 0:
-        edge_index = torch.arange(total_nodes, dtype=torch.long).repeat(2, 1)
-        edge_attr = torch.ones(edge_index.size(1), dtype=torch.float)
+
+        edge_index = torch.arange(
+            total_nodes,
+            dtype=torch.long
+        ).repeat(2, 1)
+
+        edge_attr = torch.ones(
+            edge_index.size(1),
+            dtype=torch.float
+        )
+
     else:
-        edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-        edge_attr = torch.tensor(edge_weights, dtype=torch.float)
+
+        edge_index = torch.tensor(
+            [src_list, dst_list],
+            dtype=torch.long
+        )
+
+        edge_attr = torch.tensor(
+            edge_weights,
+            dtype=torch.float
+        )
 
     # =====================================================
-    # BUILD GRAPH (NO y)
+    # BUILD GRAPH
     # =====================================================
     data = Data(
         x=x,
@@ -124,129 +225,269 @@ def build_dataset_from_single_pdb(pdb_file: str):
     )
 
     data.pdb_name = pdb_name
-    data.residue_indices = torch.arange(total_nodes, dtype=torch.long)
+
+    data.residue_indices = torch.arange(
+        total_nodes,
+        dtype=torch.long
+    )
 
     return [data]
+
 
 # =====================================================
 # PREDICTION FUNCTION
 # =====================================================
 def predict_single_pdb(pdb_file, outdir=None, hyperparams=None):
 
-    if hyperparams is None:
-        hyperparams = best_params
+    start_time = time.perf_counter()
 
-    pdb_file = os.path.abspath(pdb_file)
-    pdb_name = os.path.splitext(os.path.basename(pdb_file))[0]
-    folder = os.path.dirname(pdb_file)
+    pdb_name = os.path.splitext(
+        os.path.basename(pdb_file)
+    )[0]
 
-    # -----------------------------
-    # LOAD DATA
-    # -----------------------------
-    dataset = build_dataset_from_single_pdb(pdb_file)
+    print(f"Processing: {pdb_name}.pdb", flush=True)
 
-    print(f"📦 Loaded {len(dataset)} graphs for {pdb_name}")
+    try:
 
-    if len(dataset) == 0:
-        raise ValueError("No graphs found")
-
-    in_node_feats = dataset[0].x.size(1)
-
-    # -----------------------------
-    # MODEL
-    # -----------------------------
-    model = NodeMLP_GCN(
-        in_node_feats,
-        hidden_dim=hyperparams["hidden_dim"],
-        num_gcn_layers=hyperparams["num_gcn_layers"],
-        dropout=hyperparams["dropout"],
-        use_residual=hyperparams["residual"],
-        use_batch_norm=hyperparams["batch_norm"],
-        activation=hyperparams["activation"],
-        use_bias=hyperparams["use_bias"],
-    ).to(device)
-
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-
-    model.load_state_dict(
-        torch.load(MODEL_PATH, map_location=device, weights_only=True)
-    )
-
-    model.eval()
-    print("✅ Model loaded")
-
-    # -----------------------------
-    # DATA LOADER
-    # -----------------------------
-    loader = DataLoader(
-        dataset,
-        batch_size=16,
-        shuffle=False,
-        collate_fn=Batch.from_data_list
-    )
-
-    # -----------------------------
-    # INFERENCE
-    # -----------------------------
-    all_preds = []
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-
-            batch_idx = batch.batch if hasattr(batch, "batch") else torch.zeros(
-                batch.x.size(0), dtype=torch.long, device=device
+        # -----------------------------
+        # LOAD HYPERPARAMETERS
+        # -----------------------------
+        if hyperparams is None:
+            hyperparams = load_hyperparameters(
+                PARAMETER_PATH
             )
 
-            preds, _ = model(
-                batch.x,
-                batch.edge_index,
-                getattr(batch, "edge_attr", None),
-                batch_idx
+        pdb_file = os.path.abspath(pdb_file)
+        folder = os.path.dirname(pdb_file)
+
+        # -----------------------------
+        # LOAD DATA
+        # -----------------------------
+        dataset = build_dataset_from_single_pdb(
+            pdb_file
+        )
+
+        if len(dataset) == 0:
+            raise ValueError("No graphs found")
+
+        in_node_feats = dataset[0].x.size(1)
+
+        # -----------------------------
+        # LOAD MODEL
+        # -----------------------------
+        model = NodeMLP_GCN(
+            in_node_feats,
+            hidden_dim=hyperparams["hidden_dim"],
+            num_gcn_layers=hyperparams["num_gcn_layers"],
+            dropout=hyperparams["dropout"],
+            use_residual=hyperparams["residual"],
+            use_batch_norm=hyperparams["batch_norm"],
+            activation=hyperparams["activation"],
+            use_bias=hyperparams["use_bias"],
+        ).to(device)
+
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"Model not found: {MODEL_PATH}"
             )
 
-            all_preds.extend(preds.cpu().numpy().flatten())
+        model.load_state_dict(
+            torch.load(
+                MODEL_PATH,
+                map_location=device,
+                weights_only=True
+            )
+        )
 
-    y_pred = np.array(all_preds)
+        model.eval()
 
-    # -----------------------------
-    # OUTPUT
-    # -----------------------------
-    residue_indices = np.arange(1, len(y_pred) + 1)
-    binary = (y_pred >= BINARY_THRESHOLD).astype(int)
+        # -----------------------------
+        # DATA LOADER
+        # -----------------------------
+        loader = DataLoader(
+            dataset,
+            batch_size=16,
+            shuffle=False,
+            collate_fn=Batch.from_data_list
+        )
 
-    if outdir is None:
-        outdir = folder
-    else:
-        os.makedirs(outdir, exist_ok=True)
+        # -----------------------------
+        # INFERENCE
+        # -----------------------------
+        all_preds = []
 
-    out_csv = os.path.join(outdir, f"{pdb_name}_predictions.csv")
+        with torch.no_grad():
 
-    df = pd.DataFrame({
-        "PDB_Name": pdb_name,
-        "Residue_Index": residue_indices,
-        "Predicted_RMSF_Norm": y_pred,
-        "Predicted_Binary": binary
-    })
+            for batch in loader:
 
-    df.to_csv(out_csv, index=False)
+                batch = batch.to(device)
 
-    print(f"✅ Saved predictions → {out_csv}")
+                batch_idx = (
+                    batch.batch
+                    if hasattr(batch, "batch")
+                    else torch.zeros(
+                        batch.x.size(0),
+                        dtype=torch.long,
+                        device=device
+                    )
+                )
+
+                preds, _ = model(
+                    batch.x,
+                    batch.edge_index,
+                    getattr(batch, "edge_attr", None),
+                    batch_idx
+                )
+
+                all_preds.extend(
+                    preds.cpu().numpy().flatten()
+                )
+
+        y_pred = np.array(all_preds)
+
+        # -----------------------------
+        # OUTPUT
+        # -----------------------------
+        residue_indices = np.arange(
+            1,
+            len(y_pred) + 1
+        )
+
+        binary = (
+            y_pred >= BINARY_THRESHOLD
+        ).astype(int)
+
+        if outdir is None:
+            outdir = folder
+        else:
+            os.makedirs(
+                outdir,
+                exist_ok=True
+            )
+
+        out_csv = os.path.join(
+            outdir,
+            f"{pdb_name}_predictions.csv"
+        )
+
+        df = pd.DataFrame({
+            "PDB_Name": pdb_name,
+            "Residue_Index": residue_indices,
+            "Predicted_RMSF_Norm": y_pred,
+            "Predicted_Binary": binary
+        })
+
+        df.to_csv(
+            out_csv,
+            index=False
+        )
+
+    finally:
+
+        elapsed_time = time.perf_counter() - start_time
+
+        print(
+            f"Finished: {pdb_name} | "
+            f"Time: {elapsed_time:.2f} seconds",
+            flush=True
+        )
 
 
 # =====================================================
-# MAIN
+# MAIN: PROCESS ONE OR MULTIPLE PDB FILES
 # =====================================================
 if __name__ == "__main__":
 
     import argparse
+    import glob
+    import time
 
-    parser = argparse.ArgumentParser(description="Predict RMSF from PDB")
+    parser = argparse.ArgumentParser(
+        description="Predict RMSF for one or multiple PDB files"
+    )
 
-    parser.add_argument("-i", "--input", required=True)
-    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument(
+        "-i",
+        "--input",
+        nargs="+",
+        required=True,
+        help="One or more PDB files or wildcard patterns"
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None
+    )
 
     args = parser.parse_args()
 
-    predict_single_pdb(args.input, args.output)
+    # -------------------------------------------------
+    # EXPAND WILDCARDS AND COLLECT PDB FILES
+    # -------------------------------------------------
+    pdb_files = []
+
+    for item in args.input:
+
+        matches = glob.glob(item)
+
+        if matches:
+            pdb_files.extend(matches)
+        elif os.path.isfile(item):
+            pdb_files.append(item)
+        else:
+            print(f"Skipping: no matching file found for {item}")
+
+    # Keep only minimized PDB files and remove duplicates
+    pdb_files = list(dict.fromkeys(
+        os.path.abspath(pdb)
+        for pdb in pdb_files
+        if os.path.isfile(pdb)
+        and os.path.basename(pdb).endswith("_min.pdb")
+    ))
+
+    if not pdb_files:
+        raise SystemExit("No *_min.pdb files found.")
+
+    # -------------------------------------------------
+    # PROCESS FILES ONE BY ONE
+    # -------------------------------------------------
+    total_start = time.perf_counter()
+    successful = 0
+    failed = 0
+
+    print(f"Found {len(pdb_files)} minimized PDB files.")
+
+    for index, pdb_file in enumerate(pdb_files, start=1):
+
+        print(
+            f"\n[{index}/{len(pdb_files)}] "
+            f"Processing: {os.path.basename(pdb_file)}",
+            flush=True
+        )
+
+        try:
+            predict_single_pdb(
+                pdb_file,
+                args.output
+            )
+            successful += 1
+
+        except Exception as error:
+            failed += 1
+            print(
+                f"Failed: {os.path.basename(pdb_file)} | {error}",
+                flush=True
+            )
+
+    # -------------------------------------------------
+    # TOTAL EXECUTION TIME
+    # -------------------------------------------------
+    total_elapsed = time.perf_counter() - total_start
+
+    print("\n========== SUMMARY ==========")
+    print(f"Total PDB files: {len(pdb_files)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"Total time: {total_elapsed:.2f} seconds")
+    print("=============================")
