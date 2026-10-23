@@ -19,12 +19,18 @@ def get_activation_fn(name):
 
 
 # =========================
-# REGRESSION MODEL (RAW RMSF)
+# STANDARD GNN REGRESSION MODEL
 # =========================
 class NodeMLP_GCN(nn.Module):
-    def __init__(self, in_node_feats, hidden_dim=256, num_gcn_layers=5,
-                 dropout=0.3, use_residual=True, use_batch_norm=False,
-                 activation='ReLU', use_bias=True):
+    def __init__(self,
+                 in_node_feats,
+                 hidden_dim=128,
+                 num_gcn_layers=5,
+                 dropout=0.3,
+                 use_residual=True,
+                 use_batch_norm=False,
+                 activation='ReLU',
+                 use_bias=True):
 
         super().__init__()
 
@@ -33,24 +39,21 @@ class NodeMLP_GCN(nn.Module):
         self.activation_fn = get_activation_fn(activation)
 
         # =========================
-        # NODE FEATURE MLP
+        # 3-LAYER MLP ENCODER
+        # (64 → 128 → hidden_dim)
         # =========================
         self.node_mlp = nn.Sequential(
             nn.Linear(in_node_feats, 64, bias=use_bias),
             self.activation_fn,
             nn.Linear(64, 128, bias=use_bias),
             self.activation_fn,
-            nn.Linear(128, 128, bias=use_bias),
-            self.activation_fn,
-            nn.Linear(128, 256, bias=use_bias),
-            self.activation_fn,
-            nn.Linear(256, hidden_dim, bias=use_bias),
+            nn.Linear(128, hidden_dim, bias=use_bias),
             self.activation_fn,
             nn.Dropout(dropout)
         )
 
         # =========================
-        # GCN LAYERS (WITH EDGE WEIGHTS)
+        # GCN LAYERS IN HIDDEN SPACE
         # =========================
         self.gcn_layers = nn.ModuleList([
             GCNConv(hidden_dim, hidden_dim, bias=use_bias)
@@ -68,17 +71,18 @@ class NodeMLP_GCN(nn.Module):
         # =========================
         # OUTPUT LAYER
         # =========================
-        self.out = nn.Linear(hidden_dim, 1)  # RAW RMSF
+        self.out = nn.Linear(hidden_dim, 1)
 
-    # =========================
-    # FORWARD
-    # =========================
     def forward(self, x, edge_index, edge_attr=None, batch=None):
 
-        # NODE EMBEDDING
+        # ---------
+        # MLP encoding
+        # ---------
         x = self.node_mlp(x)
 
-        # GCN LAYERS
+        # ---------
+        # GCN layers
+        # ---------
         for i, gcn in enumerate(self.gcn_layers):
             x_res = x
 
@@ -95,7 +99,9 @@ class NodeMLP_GCN(nn.Module):
             if self.use_residual:
                 x = x + x_res
 
-        # RAW OUTPUT (per residue)
-        preds = self.out(x).squeeze(-1)  # shape: [num_nodes]
+        # ---------
+        # Regression output (RMSF)
+        # ---------
+        preds = self.out(x).squeeze(-1)
 
         return preds, None
