@@ -22,29 +22,30 @@ Install them using the helper script:
 ./basic_install.sh requirements.txt
 
 ```
-### Step 2. Install FreeSASA
+## Step 2. Install FreeSASA
 
-ProtFlap uses FreeSASA for solvent-accessible surface area calculations.
+ProtFlap uses FreeSASA to calculate solvent-accessible surface area.
 
-1. Download FreeSASA from GitHub:
-👉 https://github.com/mittinatten/freesasa
+1. Download FreeSASA from the [official FreeSASA GitHub repository](https://github.com/mittinatten/freesasa).
+2. Build and install FreeSASA according to its installation instructions.
+3. Add FreeSASA to your system `PATH` if necessary.
 
-2. Build and install FreeSASA:
-3. Add FreeSASA to your system PATH (if needed)
+## Step 3. Install Tinker
 
-### Step 3. Install Tinker
-ProtFlap requires the **Tinker molecular modeling package** for energy minimization and structure preprocessing. 
+ProtFlap requires Tinker for energy minimization and protein structure preprocessing. **Both CPU and GPU versions of Tinker are supported.** Choose the version that best suits your computational resources.
 
-Download Tinker from the official website: 
-👉 [https://dasher.wustl.edu/tinker/](https://dasher.wustl.edu/tinker/)
+- **CPU preprocessing:** Use `preprocess.py` with the CPU version of Tinker.
+- **GPU preprocessing:** Use `preprocess_gpu.py` with the GPU-enabled version of Tinker.
 
-**Setup instructions:**
+Download Tinker from the [official Tinker website](https://dasher.wustl.edu/tinker/).
 
-1. Compile Tinker following the instructions on the website. 
-2. Place your `amber99sb.prm` parameter file inside your Tinker folder. 
-3. Create your `force.key` file for the force field. **Include the following options in `force.key`:**
+### Tinker Setup
 
-```
+1. Compile or install the appropriate Tinker version following its installation instructions.
+2. Place the `amber99sb.prm` parameter file in your Tinker directory.
+3. Create a `force.key` file containing the following settings:
+
+```text
 parameters /path/to/amber99sb.prm
 forcefield /path/to/amber99sb.prm
 
@@ -54,128 +55,121 @@ verbose
 
 SOLVATE GB-HPMF
 ```
-4. Update the paths in `preprocess.py` to point to your Tinker executables, `force.key`, and parameter file:
 
+4. Configure the paths in the preprocessing script to point to your Tinker installation, `force.key`, and parameter file. Update the paths according to the version you are using.
+
+For `preprocess.py` (CPU):
+
+```python
+tinker = "/path/to/tinker/"
+force = "/path/to/force.key"
 ```
-tinker="path/to/tinker/"
-force="path/to/force.key"
 
-```
+For `preprocess_gpu.py` (GPU):
 
-### Preprocessing PDB Files
+Configure the Tinker GPU executable paths and force-field settings according to your GPU-enabled Tinker installation.
 
-All raw PDB files should be placed.
-To preprocess a PDB file:
+**Note:** GPU preprocessing requires compatible GPU hardware and a properly configured GPU-enabled Tinker installation. The standard CPU version of Tinker does not automatically provide GPU support.
 
-```
+## Preprocessing PDB Files
+
+Place your raw PDB files in an accessible directory before preprocessing.
+
+ProtFlap provides two preprocessing scripts. Select the appropriate script based on your Tinker installation.
+
+### Option 1: CPU Preprocessing
+
+Use `preprocess.py` with the CPU version of Tinker:
+
+```bash
 python preprocess.py -i protein.pdb -o output_folder
-
 ```
 
-Arguments:
+### Option 2: GPU Preprocessing
 
--i → Input file: Path to the PDB file you want to preprocess (e.g., protein.pdb).
+Use `preprocess_gpu.py` with the GPU-enabled version of Tinker:
 
--o → Output folder: Name of the folder where all results will be saved (e.g., output_folder). The folder will be created automatically if it doesn’t exist.
-
-What the script does:
-
-Adds hydrogens and converts the PDB to Tinker XYZ format.
-
-Minimizes the structure using the Amber99SB force field.
-
-Computes per-atom and per-residue energy breakdowns.
-
-Outputs:
-
-input_energy.csv → per-atom energies
-
-input_min.csv → per-residue averaged energies
-
-✅ The original PDB file is preserved, and all intermediate files are automatically removed.
-
-
-### Running Predictions
-
-After preprocessing, run ProtFlap prediction on the minimized PDB:
-
+```bash
+python preprocess_gpu.py -i protein.pdb -o output_folder
 ```
-python predict.py -i protein_min.pdb -o predictions
 
+Both scripts preprocess the input protein structure by adding hydrogens, converting the structure to Tinker XYZ format, minimizing the structure, and calculating energy features, according to the selected implementation.
+
+The output folder is created automatically if it does not exist.
+
+### Preprocessing Outputs
+
+The preprocessing workflow generates the following files:
+
+- `protein.pdb` — Original input structure, preserved.
+- `protein_min.pdb` — Energy-minimized protein structure.
+- `protein_energy.csv` — Per-atom energy features.
+- `protein_min.csv` — Per-residue averaged energy features.
+
+Intermediate files are automatically removed after preprocessing.
+
+*Note: Exact output filenames depend on the input filename and the implementation of the selected preprocessing script.*
+
+## Running Predictions
+
+After preprocessing, run ProtFlap prediction using the minimized PDB file generated by either preprocessing script:
+
+```bash
+python predict.py -i output_folder/protein_min.pdb -o predictions
 ```
-### Output
 
-Output
+The output directory is created automatically if it does not exist. If `-o` is omitted, the prediction CSV is saved in the default location specified by the prediction script.
 
-Arguments:
-
--i → Required. Path to the minimized PDB file.
--o → Optional. Folder where the prediction CSV will be saved.
-
-If not provided, the output CSV will be automatically saved in the same folder as the input PDB.
-
-The output folder will be created automatically if it does not exist.
+### Prediction Output
 
 The prediction CSV contains the following columns:
 
-residue → Index of the residue in the protein chain
-predicted_rmsf_norm → Predicted normalized RMSF value (regression output from the model)
-predicted_binary → Binary classification (0 or 1) based on the threshold
+- `residue` — Residue index in the protein chain.
+- `predicted_rmsf_norm` — Predicted normalized RMSF value, representing the continuous residue-level flexibility score.
+- `predicted_binary` — Binary classification (0 or 1) derived from the predicted flexibility score using the configured threshold.
 
-The predicted_rmsf_norm column represents the continuous flexibility score predicted by the model and can be used for regression analysis, plotting flexibility profiles, or downstream statistical analysis.
-
-The predicted_binary column is derived from the RMSF prediction using a threshold and is used for classification-based interpretation (flexible vs non-flexible residues).
+The continuous prediction can be used for flexibility-profile visualization, regression analysis, and downstream statistical analyses. The binary prediction provides a classification-based interpretation of residue flexibility.
 
 ## Quickstart Example
 
-This example demonstrates a full run from raw PDB → preprocessing → prediction using the provided `5m99A02.pdb`.
+This example demonstrates the workflow from a raw PDB structure to residue-level flexibility predictions using the provided `5m99A02.pdb` file.
 
 ### Step 1. Preprocess the PDB
 
-Place the raw PDB file in the folder (already included: `5m99A02.pdb`).
+Choose **one** of the following options.
 
-Run the preprocessing script:
+**CPU version:**
 
-```
+```bash
 python preprocess.py -i 5m99A02.pdb -o example
-
 ```
-This will:
 
-Add hydrogens and convert the PDB to Tinker XYZ format
+**GPU version:**
 
-Minimize the structure using the Amber99SB force field
-Compute per-atom and per-residue energy breakdowns
+```bash
+python preprocess_gpu.py -i 5m99A02.pdb -o example
+```
 
-Generate two output CSVs in the example folder:
+Both commands preprocess the input structure and generate the minimized PDB and energy-feature files required for prediction.
 
-5m99A02_energy.csv → per-atom energies
+Expected outputs include:
 
-5m99A02_min.csv → per-residue averaged energies
-
-The minimized PDB will be saved as 5m99A02_min.pdb
+- `example/5m99A02_min.pdb` — Minimized structure.
+- Energy-feature CSV files generated by the selected preprocessing script.
 
 ### Step 2. Run ProtFlap Prediction
 
-Use the minimized PDB as input for the prediction:
+Use the minimized PDB as input:
 
-```
+```bash
 python predict.py -i example/5m99A02_min.pdb -o example/predictions
-
 ```
-The output CSV (e.g., 5m99A02_min_predictions.csv) 
 
-**Notes**
+The prediction CSV will be saved in the specified output directory.
 
-Always use the _min.pdb produced by preprocess.sh as input.
+### Notes
 
-The script outputs residue-level flexibility predictions.
-
-GPU support can be enabled if compatible hardware and CUDA versions are installed.
-
-
-
-
-
-
-
+- Always use the `_min.pdb` file generated during preprocessing as the prediction input.
+- Both CPU and GPU preprocessing workflows produce the structure required for residue-level flexibility prediction, provided their outputs meet the prediction script's input requirements.
+- GPU acceleration applies to preprocessing when using `preprocess_gpu.py` with a compatible GPU-enabled Tinker installation.
+- Prediction can use CPU or GPU depending on the model implementation and available hardware.
