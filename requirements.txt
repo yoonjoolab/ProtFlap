@@ -9,6 +9,4 @@ optuna>=3.0.0
 networkx>=3.1
 biopython>=1.81
 aaindex>=1.0.0
-
-
-
+pdbfixer
